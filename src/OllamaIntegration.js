@@ -1,0 +1,910 @@
+import { Ollama } from 'ollama';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { dim } from './utils.js';
+
+// Get current directory for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Load configuration
+const configPath = path.join(__dirname, '..', 'config.json');
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+
+export default class OllamaIntegration {
+    constructor(options = {}) {
+        this.ollama = new Ollama({
+            host: options.host || config.ollama.host
+        });
+        this.model = options.model || config.ollama.defaultModel;
+        this.systemPrompt = options.systemPrompt || config.ollama.systemPrompt;
+        this.conversationHistory = [];
+        this.contextEntities = new Map(); // Track mentioned entities (notes, files, etc.)
+        this.maxContextLength = options.maxContextLength || 100; // Increased from 20 to 100 messages
+        this.debugLogging = options.debugLogging || false; // Control internal LLM call logging
+    }
+
+    async initialize() {
+        try {
+            // Test connection to Ollama
+            const models = await this.ollama.list();
+            console.log(`Connected to Ollama. Available models: [${models.models.map(m => m.name).join(', ')}]`);
+            
+            // Check if our preferred model exists
+            const modelExists = models.models.some(m => m.name.includes(this.model));
+            if (!modelExists) {
+                console.log(`Model ${this.model} not found. Trying to pull it...`);
+                await this.ollama.pull({ model: this.model });
+                console.log(`Successfully pulled model ${this.model}`);
+            }
+            
+            return true;
+        } catch (error) {
+            console.error('Failed to initialize Ollama:', error.message);
+            return false;
+        }
+    }
+
+    async generateResponse(userMessage, mcpClient = null) {
+        try {
+            // Add user message to conversation history
+            this.conversationHistory.push({
+                role: 'user',
+                content: userMessage,
+                timestamp: new Date().toISOString()
+            });
+
+            // Extract and track entities from user message
+            this.trackEntitiesFromMessage(userMessage);
+
+            // Analyze user message and automatically execute tools if needed
+            const autoExecutionResult = await this.analyzeAndExecuteTools(userMessage, mcpClient);
+            if (autoExecutionResult) {
+                // If tools were automatically executed, add the result to conversation
+                this.conversationHistory.push({
+                    role: 'assistant',
+                    content: autoExecutionResult,
+                    timestamp: new Date().toISOString()
+                });
+                return autoExecutionResult;
+            }
+
+            // Prepare context about available MCP tools/resources
+            let mcpContext = '';
+            if (mcpClient) {
+                try {
+                    const tools = await mcpClient.listTools();
+                    const toolsList = tools.tools.map(tool => {
+                        const serverInfo = tool.serverName ? ` (${tool.serverName})` : '';
+                        return `- ${tool.qualifiedName || tool.name}${serverInfo}(${this.getToolParameters(tool)}): ${tool.description || 'No description'}`;
+                    }).join('\n');
+                    mcpContext += `\nAvailable MCP Tools:\n${toolsList}\n`;
+                } catch (error) {
+                    // Tools might not be available
+                }
+
+                try {
+                    const resources = await mcpClient.listResources();
+                    const resourcesList = resources.resources.map(resource => {
+                        const serverInfo = resource.serverName ? ` (${resource.serverName})` : '';
+                        return `- ${resource.qualifiedUri || resource.uri}${serverInfo}: ${resource.name || 'Resource'}`;
+                    }).join('\n');
+                    mcpContext += `\nAvailable MCP Resources:\n${resourcesList}\n`;
+                } catch (error) {
+                    // Resources might not be available
+                }
+            }
+
+            // Enhanced system prompt for automatic tool usage
+            const enhancedSystemPrompt = this.systemPrompt + mcpContext + `
+
+IMPORTANT: You have access to the MCP tools listed above from multiple servers. When a user asks for something that can be accomplished with these tools, you should:
+1. Identify the appropriate tool(s) to use (note server names in parentheses)
+2. Determine the required parameters
+3. Execute the tool(s) automatically
+4. Provide a helpful response based on the results
+
+The system will automatically route tool calls to the correct server based on the tool information.
+
+For example:
+- If asked to "create a note" or "save information", use create_note tool
+- If asked to "read notes" or "show me notes", use get_all_notes or get_note tool  
+- If asked to "update" or "modify" a note, use update_note tool
+- If asked to "delete" or "remove" a note, use delete_note tool
+- If asked about "what notes do I have", use get_all_notes tool
+
+Always explain what you're doing and provide the results in a user-friendly format.`;
+
+            // Create messages for the model
+            const messages = [
+                {
+                    role: 'system',
+                    content: enhancedSystemPrompt
+                },
+                ...this.conversationHistory
+            ];
+
+            this.debugLog("Generating main response with system prompt:", enhancedSystemPrompt);
+
+            // Generate response from Ollama
+            const response = await this.ollama.chat({
+                model: this.model,
+                messages: messages,
+                stream: false
+            });
+
+            const assistantMessage = response.message.content;
+            this.debugLog("Main response generated:", assistantMessage);
+
+            // Add assistant response to conversation history
+            this.conversationHistory.push({
+                role: 'assistant',
+                content: assistantMessage,
+                timestamp: new Date().toISOString()
+            });
+
+            // Keep conversation history manageable (last N messages)
+            if (this.conversationHistory.length > this.maxContextLength) {
+                this.conversationHistory = this.conversationHistory.slice(-this.maxContextLength);
+            }
+
+            return assistantMessage;
+
+        } catch (error) {
+            console.error('Error generating response:', error.message);
+            return 'Sorry, I encountered an error while generating a response. Please try again.';
+        }
+    }
+
+    async executeToolIfRequested(response, mcpClient) {
+        if (!mcpClient) return null;
+
+        try {
+            // Get available tools to understand what's possible
+            const tools = await mcpClient.listTools();
+            if (tools.tools.length === 0) return null;
+
+            // Use LLM to analyze if the assistant's response suggests tool execution
+            const toolAnalysis = await this.analyzeAssistantResponseForTools(response, tools.tools);
+            
+            if (toolAnalysis && toolAnalysis.shouldExecute) {
+                const toolName = toolAnalysis.toolName;
+                
+                // Get the specific tool definition - check both name and qualified name
+                const tool = tools.tools.find(t => t.name === toolName || t.qualifiedName === toolName);
+                if (!tool) {
+                    return `Tool "${toolName}" is not available. Available tools: ${tools.tools.map(t => t.qualifiedName || t.name).join(', ')}`;
+                }
+
+                // Use the tool's server name for execution if available, otherwise use the tool name directly
+                const executionName = tool.serverName ? tool.name : toolName;
+                
+                console.log(`\n🔧 Executing tool from AI response analysis: ${toolName} (server: ${tool.serverName || 'unknown'}) with args:`, toolAnalysis.arguments);
+                const toolResult = await mcpClient.callTool({
+                    name: executionName,
+                    arguments: toolAnalysis.arguments
+                });
+
+                console.log('Tool result:', JSON.stringify(toolResult, null, 2));
+                
+                return this.formatToolResponseDynamic(toolName, toolResult, toolAnalysis.arguments, tool);
+            }
+
+            return null;
+            
+        } catch (error) {
+            console.error('Error in executeToolIfRequested:', error.message);
+            return null;
+        }
+    }
+
+    async analyzeAssistantResponseForTools(assistantResponse, tools) {
+        try {
+            const toolsInfo = tools.map(tool => ({
+                name: tool.name,
+                qualifiedName: tool.qualifiedName || tool.name,
+                serverName: tool.serverName || 'unknown',
+                description: tool.description || 'No description',
+                parameters: this.getToolParameters(tool),
+                schema: tool.inputSchema
+            }));
+
+            const prompt = `Analyze the assistant's response to determine if it suggests or implies that a tool should be executed.
+
+Assistant's response: "${assistantResponse}"
+
+Available tools (with server information):
+${toolsInfo.map(tool => `- ${tool.qualifiedName || tool.name} (${tool.serverName}): ${tool.description} [${tool.parameters}]`).join('\n')}
+
+Recent conversation context:
+${this.conversationHistory.slice(-5).map(msg => `${msg.role}: ${msg.content}`).join('\n')}
+
+Instructions:
+1. Look for implicit or explicit mentions of actions that could be performed with available tools
+2. Consider context from the conversation history
+3. Identify if the assistant is suggesting to perform an action that matches a tool
+4. Extract the necessary parameters based on the conversation context
+5. When multiple servers have similar tools, prefer the most appropriate one based on context
+6. Examples of what to look for:
+   - "Let me create a note for you"
+   - "I'll save this information"
+   - "I can update that note"
+   - "Let me retrieve your notes"
+   - "I'll delete that for you"
+
+Respond with a JSON object:
+{
+  "shouldExecute": true/false,
+  "toolName": "tool_name_if_should_execute",
+  "serverName": "server_name_if_should_execute",
+  "arguments": {"param1": "value1", "param2": "value2"},
+  "confidence": 0.0-1.0,
+  "reasoning": "explanation of why this tool should/shouldn't be executed"
+}
+
+If shouldExecute is false, only include shouldExecute, confidence, and reasoning.
+Use the exact tool name (not qualified name) for toolName field.`;
+
+            this.debugLog("Analyzing assistant response for tools with prompt:", prompt);
+
+            const response = await this.ollama.generate({
+                model: this.model,
+                prompt: prompt,
+                stream: false
+            });
+
+            const cleanResponse = response.response.trim();
+            this.debugLog("Raw LLM response for tool analysis:", cleanResponse);
+
+            const jsonMatch = cleanResponse.match(/\{[\s\S]*\}/);
+            const jsonString = jsonMatch ? jsonMatch[0] : cleanResponse;
+            
+            const analysis = JSON.parse(jsonString);
+            this.debugLog("Parsed tool analysis result:", analysis);
+            
+            // Only execute if confidence is high enough
+            if (analysis.shouldExecute && analysis.confidence >= 0.7) {
+                this.debugLog("Tool execution approved with confidence:", analysis.confidence);
+                return analysis;
+            }
+            
+            this.debugLog("Tool execution rejected - confidence too low or shouldExecute is false");
+            return null;
+            
+        } catch (error) {
+            console.error('Error analyzing assistant response for tools:', error.message);
+            return null;
+        }
+    }
+
+    clearHistory() {
+        this.conversationHistory = [];
+        this.contextEntities.clear();
+    }
+
+    setModel(model) {
+        this.model = model;
+    }
+
+    setSystemPrompt(prompt) {
+        this.systemPrompt = prompt;
+    }
+
+    setDebugLogging(enabled) {
+        this.debugLogging = enabled;
+    }
+
+    debugLog(message, data = null) {
+        if (this.debugLogging) {
+            const grayColor = '\x1b[90m'; // Gray color
+            const resetColor = '\x1b[0m'; // Reset color
+            if (data) {
+                console.log(`${grayColor}[DEBUG] ${message}${resetColor}`, dim(data));
+            } else {
+                console.log(`${grayColor}[DEBUG] ${message}${resetColor}`);
+            }
+        }
+    }
+
+    trackEntitiesFromMessage(message) {
+        const lowerMessage = message.toLowerCase();
+        
+        // Generic entity tracking - look for quoted strings and common patterns
+        const quotedMatches = message.match(/["']([^"']+)["']/g);
+        if (quotedMatches) {
+            quotedMatches.forEach(match => {
+                const entityName = match.slice(1, -1);
+                if (entityName.length > 1) {
+                    // Determine entity type based on context
+                    let entityType = 'unknown';
+                    if (lowerMessage.includes('note')) entityType = 'note';
+                    else if (lowerMessage.includes('folder') || lowerMessage.includes('path') || lowerMessage.includes('directory')) entityType = 'folder';
+                    else if (lowerMessage.includes('file')) entityType = 'file';
+                    else if (lowerMessage.includes('resource')) entityType = 'resource';
+                    
+                    this.contextEntities.set(`${entityType}:${entityName.toLowerCase()}`, {
+                        type: entityType,
+                        name: entityName,
+                        lastMentioned: new Date().toISOString(),
+                        frequency: (this.contextEntities.get(`${entityType}:${entityName.toLowerCase()}`)?.frequency || 0) + 1
+                    });
+                }
+            });
+        }
+        
+        // Track common patterns without quotes
+        const patterns = [
+            { regex: /(?:note|item|entry)\s+(?:called|named)\s+(\w+)/gi, type: 'note' },
+            { regex: /(?:folder|directory|path)\s+(?:called|named)\s+(\w+)/gi, type: 'folder' },
+            { regex: /(?:file)\s+(?:called|named)\s+(\w+)/gi, type: 'file' },
+            { regex: /(?:resource)\s+(?:called|named)\s+(\w+)/gi, type: 'resource' }
+        ];
+        
+        for (const pattern of patterns) {
+            let match;
+            while ((match = pattern.regex.exec(message)) !== null) {
+                const entityName = match[1];
+                if (entityName && entityName.length > 1 && !['the', 'my', 'a', 'an', 'this', 'that'].includes(entityName.toLowerCase())) {
+                    this.contextEntities.set(`${pattern.type}:${entityName.toLowerCase()}`, {
+                        type: pattern.type,
+                        name: entityName,
+                        lastMentioned: new Date().toISOString(),
+                        frequency: (this.contextEntities.get(`${pattern.type}:${entityName.toLowerCase()}`)?.frequency || 0) + 1
+                    });
+                }
+            }
+        }
+    }
+
+    getRecentEntities(type = null, limit = 10) {
+        const entities = Array.from(this.contextEntities.values());
+        
+        let filtered = type ? entities.filter(e => e.type === type) : entities;
+        
+        // Sort by last mentioned time and frequency
+        filtered.sort((a, b) => {
+            const timeA = new Date(a.lastMentioned).getTime();
+            const timeB = new Date(b.lastMentioned).getTime();
+            if (timeA !== timeB) return timeB - timeA; // Most recent first
+            return b.frequency - a.frequency; // Most frequent first if same time
+        });
+        
+        return filtered.slice(0, limit);
+    }
+
+    buildContextualPrompt(userMessage, toolName, toolSchema) {
+        // Get conversation context (last 10 messages for parameter extraction)
+        const recentHistory = this.conversationHistory.slice(-10);
+        const conversationContext = recentHistory.map(msg => 
+            `${msg.role}: ${msg.content}`
+        ).join('\n');
+        
+        // Get relevant entities
+        const recentNotes = this.getRecentEntities('note', 5);
+        const recentFolders = this.getRecentEntities('folder', 3);
+        
+        let contextInfo = '';
+        if (recentNotes.length > 0) {
+            contextInfo += `\nRecently mentioned notes: ${recentNotes.map(n => n.name).join(', ')}`;
+        }
+        if (recentFolders.length > 0) {
+            contextInfo += `\nRecently mentioned folders: ${recentFolders.map(f => f.path).join(', ')}`;
+        }
+
+        return `Extract parameters for the tool "${toolName}" from this user message, considering the full conversation context.
+
+Current user message: "${userMessage}"
+
+Recent conversation context:
+${conversationContext}
+${contextInfo}
+
+Tool schema: ${JSON.stringify(toolSchema, null, 2)}
+
+Instructions:
+1. Look at the ENTIRE conversation context to understand what the user is referring to
+2. If the user says "update mentioned note" or "delete that note", find the note name from previous messages
+3. If the user refers to "it", "that", "the one", etc., use context to determine what they mean
+4. When extracting note names, prefer recently mentioned ones if the current message is ambiguous
+5. Use conversation context to fill in missing parameters
+
+Please respond with ONLY a valid JSON object containing the extracted parameters. If a parameter cannot be determined from the message or context, omit it from the response.
+
+Examples:
+- Current: "update mentioned note" + Context shows "meeting note" was discussed → {"name": "meeting"}
+- Current: "create a note called meeting with agenda items" → {"name": "meeting", "content": "agenda items"}
+- Current: "delete that note" + Context shows "project note" was last mentioned → {"name": "project"}
+
+JSON response:`;
+    }
+
+    getToolParameters(tool) {
+        if (!tool.inputSchema || !tool.inputSchema.properties) {
+            return '';
+        }
+        const params = Object.keys(tool.inputSchema.properties);
+        const required = tool.inputSchema.required || [];
+        return params.map(param => required.includes(param) ? param : `[${param}]`).join(', ');
+    }
+
+    async analyzeAndExecuteTools(userMessage, mcpClient) {
+        if (!mcpClient) return null;
+
+        try {
+            // Get available tools and resources from MCP server(s)
+            const [toolsResponse, resourcesResponse] = await Promise.allSettled([
+                mcpClient.listTools(),
+                mcpClient.listResources()
+            ]);
+
+            const tools = toolsResponse.status === 'fulfilled' ? toolsResponse.value.tools : [];
+            const resources = resourcesResponse.status === 'fulfilled' ? resourcesResponse.value.resources : [];
+
+            if (tools.length === 0) {
+                return null; // No tools available for auto-execution
+            }
+
+            // Use LLM to analyze user intent and determine if any tools should be executed
+            const toolMatch = await this.analyzeUserIntentWithLLM(userMessage, tools, resources);
+            
+            if (toolMatch && toolMatch.shouldExecute) {
+                // Find the tool definition to get server information
+                const tool = tools.find(t => t.name === toolMatch.toolName || t.qualifiedName === toolMatch.toolName);
+                if (!tool) {
+                    console.error(`Tool "${toolMatch.toolName}" not found in available tools`);
+                    return null;
+                }
+
+                // Use the tool's server name for execution if available, otherwise use the tool name directly
+                const executionName = tool.serverName ? tool.name : toolMatch.toolName;
+                
+                this.debugLog(`\n🤖 Auto-executing tool: ${toolMatch.toolName} (server: ${tool.serverName || 'unknown'}) with LLM-determined args: ${toolMatch.arguments}`);
+                
+                const toolResult = await mcpClient.callTool({
+                    name: executionName,
+                    arguments: toolMatch.arguments
+                });
+
+                
+                this.debugLog(`Tool result: ${JSON.stringify(toolResult, null, 2)}`);
+                
+                // Return both the raw tool result and formatted version for flexible use
+                return {
+                    toolName: toolMatch.toolName,
+                    arguments: toolMatch.arguments,
+                    rawResult: toolResult,
+                    formatted: this.formatToolResponseDynamic(toolMatch.toolName, toolResult, toolMatch.arguments, tool),
+                    tool: tool
+                };
+            }
+
+        } catch (error) {
+            console.error('Error in analyzeAndExecuteTools:', error.message);
+        }
+
+        return null; // No automatic execution performed
+    }
+
+    async analyzeUserIntentWithLLM(userMessage, tools, resources) {
+        try {
+            const toolsInfo = tools.map(tool => ({
+                name: tool.name,
+                qualifiedName: tool.qualifiedName || tool.name,
+                serverName: tool.serverName || 'unknown',
+                description: tool.description || 'No description',
+                parameters: this.getToolParameters(tool)
+            }));
+
+            const resourcesInfo = resources.map(resource => ({
+                uri: resource.uri,
+                qualifiedUri: resource.qualifiedUri || resource.uri,
+                serverName: resource.serverName || 'unknown',
+                name: resource.name || 'Resource',
+                mimeType: resource.mimeType || 'unknown'
+            }));
+
+            const prompt = `Analyze the user's message and determine if any available tools should be automatically executed.
+
+User message: "${userMessage}"
+
+Available tools (with server information):
+${toolsInfo.map(tool => `- ${tool.qualifiedName || tool.name} (${tool.serverName}): ${tool.description} [${tool.parameters}]`).join('\n')}
+
+Available resources (with server information):
+${resourcesInfo.map(res => `- ${res.qualifiedUri || res.uri} (${res.serverName}): ${res.name} (${res.mimeType})`).join('\n')}
+
+Recent conversation context:
+${this.conversationHistory.slice(-5).map(msg => `${msg.role}: ${msg.content}`).join('\n')}
+
+Instructions:
+1. Determine if the user's message clearly indicates they want to perform an action that matches one of the available tools
+2. If yes, identify the most appropriate tool and extract the required parameters
+3. Consider the conversation context for ambiguous references (like "that", "it", "mentioned")
+4. When multiple servers have similar tools, prefer the most appropriate one based on context
+5. Only suggest automatic execution if you're confident about the user's intent
+
+Common patterns to recognize:
+- "analyze all my notes" / "analyze my notes" / "show me all notes" → get_all_notes
+- "create a note" / "save this" / "make a note" → create_note
+- "read note X" / "show me note X" / "get note X" → get_note
+- "update note X" / "modify note X" / "change note X" → update_note
+- "delete note X" / "remove note X" → delete_note
+- "list all notes" / "what notes do I have" → get_all_notes
+- "analyze", "examine", "review", "look at" + "notes" → get_all_notes
+
+Respond with a JSON object in this format:
+{
+  "shouldExecute": true/false,
+  "toolName": "tool_name_if_should_execute",
+  "serverName": "server_name_if_should_execute",
+  "arguments": {"param1": "value1", "param2": "value2"},
+  "confidence": 0.0-1.0,
+  "reasoning": "explanation of why this tool should/shouldn't be executed"
+}
+
+If shouldExecute is false, only include shouldExecute, confidence, and reasoning.
+Use the exact tool name (not qualified name) for toolName field.`;
+
+            this.debugLog("Analyzing user intent with LLM using prompt:", prompt);
+
+            const response = await this.ollama.generate({
+                model: this.model,
+                prompt: prompt,
+                stream: false
+            });
+
+            const cleanResponse = response.response.trim();
+            this.debugLog("Raw LLM response for user intent analysis:", cleanResponse);
+
+            const jsonMatch = cleanResponse.match(/\{[\s\S]*\}/);
+            const jsonString = jsonMatch ? jsonMatch[0] : cleanResponse;
+            
+            const analysis = JSON.parse(jsonString);
+            this.debugLog("Parsed user intent analysis result:", analysis);
+            
+            // Only execute if confidence is high enough
+            if (analysis.shouldExecute && analysis.confidence >= 0.7) {
+                this.debugLog("User intent analysis approved with confidence:", analysis.confidence);
+                return analysis;
+            }
+            
+            this.debugLog("User intent analysis rejected - confidence too low or shouldExecute is false");
+            return null;
+            
+        } catch (error) {
+            console.error('Error analyzing user intent with LLM:', error.message);
+            return null;
+        }
+    }
+
+    async extractParametersWithLLM(argString, toolName, toolSchema, context = '') {
+        try {
+            const prompt = `Extract parameters for the tool "${toolName}" from the given information.
+
+Tool schema: ${JSON.stringify(toolSchema, null, 2)}
+
+Argument string: "${argString}"
+Full context: "${context}"
+Recent conversation: ${this.conversationHistory.slice(-3).map(msg => `${msg.role}: ${msg.content}`).join('\n')}
+
+Instructions:
+1. Parse the argument string and context to extract tool parameters
+2. Use the tool schema to understand what parameters are expected
+3. Consider conversation history for ambiguous references
+4. Return only valid JSON with the extracted parameters
+
+JSON response:`;
+
+            this.debugLog("Extracting parameters with LLM using prompt:", prompt);
+
+            const response = await this.ollama.generate({
+                model: this.model,
+                prompt: prompt,
+                stream: false
+            });
+
+            const cleanResponse = response.response.trim();
+            this.debugLog("Raw LLM response for parameter extraction:", cleanResponse);
+
+            const jsonMatch = cleanResponse.match(/\{[\s\S]*\}/);
+            const jsonString = jsonMatch ? jsonMatch[0] : cleanResponse;
+            
+            const result = JSON.parse(jsonString);
+            this.debugLog("Parsed parameter extraction result:", result);
+            
+            return result;
+            
+        } catch (error) {
+            console.error('Error extracting parameters with LLM:', error.message);
+            this.debugLog("Parameter extraction failed, falling back to simple parsing");
+            // Fallback to simple parsing
+            return this.fallbackParameterExtraction(argString, toolName);
+        }
+    }
+
+    formatToolResponseDynamic(toolName, toolResult, args, tool) {
+        try {
+            // Use LLM to format the response based on tool result and context
+            const prompt = `Format a user-friendly response for a tool execution result.
+
+Tool name: ${toolName}
+Tool description: ${tool?.description || 'No description'}
+Tool arguments used: ${JSON.stringify(args)}
+Tool result: ${JSON.stringify(toolResult, null, 2)}
+
+Instructions:
+1. Create a clear, user-friendly summary of what was accomplished
+2. Include relevant details from the result
+3. Use appropriate emojis to make it visually appealing
+4. If the result contains data, present it in a readable format
+5. If there was an error, explain it clearly
+
+Response:`;
+
+            // For immediate response, use a simpler formatting approach
+            // In a real implementation, you might want to make this async
+            return this.simpleFormatToolResponse(toolName, toolResult, args);
+            
+        } catch (error) {
+            console.error('Error formatting tool response:', error.message);
+            return this.simpleFormatToolResponse(toolName, toolResult, args);
+        }
+    }
+
+    simpleFormatToolResponse(toolName, toolResult, args) {
+        // Simple fallback formatting
+        if (toolResult.content && toolResult.content[0]) {
+            const content = toolResult.content[0];
+            if (content.text) {
+                try {
+                    const data = JSON.parse(content.text);
+                    if (Array.isArray(data)) {
+                        return `✅ Tool "${toolName}" executed successfully. Found ${data.length} items:\n\n${JSON.stringify(data, null, 2)}`;
+                    }
+                    return `✅ Tool "${toolName}" executed successfully:\n\n${JSON.stringify(data, null, 2)}`;
+                } catch (e) {
+                    return `✅ Tool "${toolName}" executed successfully:\n\n${content.text}`;
+                }
+            }
+        }
+        
+        if (toolResult.isError) {
+            return `❌ Tool "${toolName}" failed: ${toolResult.content?.[0]?.text || 'Unknown error'}`;
+        }
+        
+        return `✅ Tool "${toolName}" executed successfully with arguments: ${JSON.stringify(args)}`;
+    }
+
+    fallbackParameterExtraction(userMessage, toolName) {
+        // Generic fallback parameter extraction
+        const lowerMessage = userMessage.toLowerCase();
+        
+        // Try to extract simple key-value patterns
+        const params = {};
+        
+        // Extract quoted strings as potential parameter values
+        const quotedMatches = userMessage.match(/["']([^"']+)["']/g);
+        if (quotedMatches) {
+            // If we have quoted strings, try to use them as parameter values
+            const values = quotedMatches.map(match => match.slice(1, -1));
+            
+            // Simple heuristics for common parameter names
+            if (values.length >= 1) {
+                if (lowerMessage.includes('name') || lowerMessage.includes('call') || lowerMessage.includes('title')) {
+                    params.name = values[0];
+                }
+                if (values.length >= 2 && (lowerMessage.includes('content') || lowerMessage.includes('with'))) {
+                    params.content = values[1];
+                }
+                if (lowerMessage.includes('path') || lowerMessage.includes('folder') || lowerMessage.includes('directory')) {
+                    params.path = values[0];
+                    params.folderPath = values[0];
+                }
+            }
+        }
+        
+        // If the message is ambiguous, use recently mentioned entities
+        const ambiguousPatterns = [
+            /(?:update|edit|modify|change).*(?:mentioned|that|the|it)/i,
+            /(?:delete|remove).*(?:mentioned|that|the|it)/i,
+            /(?:get|show|read).*(?:mentioned|that|the|it)/i
+        ];
+        
+        const isAmbiguous = ambiguousPatterns.some(pattern => pattern.test(userMessage));
+        
+        if (isAmbiguous) {
+            // Use the most recently mentioned entity of any type
+            const recentEntities = this.getRecentEntities(null, 1);
+            if (recentEntities.length > 0) {
+                const entity = recentEntities[0];
+                if (entity.type === 'note') {
+                    params.name = entity.name;
+                } else if (entity.type === 'folder') {
+                    params.path = entity.path;
+                    params.folderPath = entity.path;
+                }
+            }
+        }
+        
+        return params;
+    }
+
+    formatToolResponse(toolName, toolResult, args) {
+        // Track successful operations for future reference (generic entity tracking)
+        this.trackSuccessfulOperation(toolName, args);
+
+        // Use the dynamic formatting method
+        return this.simpleFormatToolResponse(toolName, toolResult, args);
+    }
+
+    trackSuccessfulOperation(toolName, args) {
+        // Generic tracking based on common parameter patterns
+        if (args.name) {
+            // Determine entity type from tool name
+            let entityType = 'item';
+            if (toolName.includes('note')) entityType = 'note';
+            else if (toolName.includes('file')) entityType = 'file';
+            else if (toolName.includes('folder') || toolName.includes('directory')) entityType = 'folder';
+            else if (toolName.includes('resource')) entityType = 'resource';
+            
+            let operation = 'processed';
+            if (toolName.includes('create') || toolName.includes('add')) operation = 'created';
+            else if (toolName.includes('update') || toolName.includes('edit') || toolName.includes('modify')) operation = 'updated';
+            else if (toolName.includes('delete') || toolName.includes('remove')) operation = 'deleted';
+            else if (toolName.includes('get') || toolName.includes('list') || toolName.includes('show')) operation = 'accessed';
+
+            this.contextEntities.set(`${entityType}:${args.name.toLowerCase()}`, {
+                type: entityType,
+                name: args.name,
+                lastMentioned: new Date().toISOString(),
+                frequency: (this.contextEntities.get(`${entityType}:${args.name.toLowerCase()}`)?.frequency || 0) + 1,
+                operation: operation
+            });
+        }
+
+        // Track entities from tool results if they contain arrays of items
+        if (toolResult?.content?.[0]?.text) {
+            try {
+                const data = JSON.parse(toolResult.content[0].text);
+                if (Array.isArray(data)) {
+                    data.forEach(item => {
+                        if (item.name) {
+                            let entityType = 'item';
+                            if (toolName.includes('note')) entityType = 'note';
+                            else if (toolName.includes('file')) entityType = 'file';
+                            
+                            this.contextEntities.set(`${entityType}:${item.name.toLowerCase()}`, {
+                                type: entityType,
+                                name: item.name,
+                                lastMentioned: new Date().toISOString(),
+                                frequency: (this.contextEntities.get(`${entityType}:${item.name.toLowerCase()}`)?.frequency || 0) + 1,
+                                operation: 'listed'
+                            });
+                        }
+                    });
+                }
+            } catch (e) {
+                // Ignore JSON parsing errors for entity tracking
+            }
+        }
+    }
+
+    formatResourceResponse(resourceContent) {
+        if (resourceContent.contents && resourceContent.contents[0]) {
+            const content = resourceContent.contents[0];
+            if (content.mimeType === 'application/json') {
+                try {
+                    const data = JSON.parse(content.text);
+                    if (Array.isArray(data)) {
+                        return `📚 Resource contains ${data.length} items:\n\n${JSON.stringify(data, null, 2)}`;
+                    }
+                    return `📚 Resource content:\n\n${JSON.stringify(data, null, 2)}`;
+                } catch (e) {
+                    return `📚 Resource content:\n\n${content.text}`;
+                }
+            }
+            return `📚 Resource content:\n\n${content.text}`;
+        }
+        return "📚 Resource content not available.";
+    }
+
+    async generateResponseWithToolContext(userMessage, toolExecutionResult, mcpClient = null) {
+        try {
+            // Add user message to conversation history
+            this.conversationHistory.push({
+                role: 'user',
+                content: userMessage,
+                timestamp: new Date().toISOString()
+            });
+
+            // Extract and track entities from user message
+            this.trackEntitiesFromMessage(userMessage);
+
+            // Add tool execution result as context
+            const toolContext = `\n\n=== Tool Execution Result ===\nTool: ${toolExecutionResult.toolName}\nArguments: ${JSON.stringify(toolExecutionResult.arguments)}\nResult: ${JSON.stringify(toolExecutionResult.rawResult, null, 2)}\n=== End Tool Result ===\n`;
+
+            // Prepare context about available MCP tools/resources
+            let mcpContext = '';
+            if (mcpClient) {
+                try {
+                    const tools = await mcpClient.listTools();
+                    const toolsList = tools.tools.map(tool => {
+                        const serverInfo = tool.serverName ? ` (${tool.serverName})` : '';
+                        return `- ${tool.qualifiedName || tool.name}${serverInfo}(${this.getToolParameters(tool)}): ${tool.description || 'No description'}`;
+                    }).join('\n');
+                    mcpContext += `\nAvailable MCP Tools:\n${toolsList}\n`;
+                } catch (error) {
+                    // Tools might not be available
+                }
+
+                try {
+                    const resources = await mcpClient.listResources();
+                    const resourcesList = resources.resources.map(resource => {
+                        const serverInfo = resource.serverName ? ` (${resource.serverName})` : '';
+                        return `- ${resource.qualifiedUri || resource.uri}${serverInfo}: ${resource.name || 'Resource'}`;
+                    }).join('\n');
+                    mcpContext += `\nAvailable MCP Resources:\n${resourcesList}\n`;
+                } catch (error) {
+                    // Resources might not be available
+                }
+            }
+
+            // Enhanced system prompt for responding with tool context
+            const enhancedSystemPrompt = this.systemPrompt + mcpContext + toolContext + `
+
+IMPORTANT: A tool has been automatically executed based on the user's request. The tool execution result is provided above. 
+
+Your task is to:
+1. Analyze the tool execution result
+2. Provide a clear, helpful response to the user based on the tool output
+3. Format the information in a user-friendly way
+4. Explain what was accomplished and present the results clearly
+5. Use appropriate formatting and emojis to make the response engaging
+
+The user asked: "${userMessage}"
+The tool was executed and the result is provided in the context above.
+
+Please provide a comprehensive, user-friendly response based on the tool execution result.`;
+
+            // Create messages for the model
+            const messages = [
+                {
+                    role: 'system',
+                    content: enhancedSystemPrompt
+                },
+                ...this.conversationHistory
+            ];
+
+            this.debugLog("Generating response with tool context:", enhancedSystemPrompt);
+
+            // Generate response from Ollama
+            const response = await this.ollama.chat({
+                model: this.model,
+                messages: messages,
+                stream: false
+            });
+
+            const assistantMessage = response.message.content;
+            this.debugLog("Tool context response generated:", assistantMessage);
+
+            // Add assistant response to conversation history
+            this.conversationHistory.push({
+                role: 'assistant',
+                content: assistantMessage,
+                timestamp: new Date().toISOString()
+            });
+
+            // Keep conversation history manageable
+            if (this.conversationHistory.length > this.maxContextLength) {
+                this.conversationHistory = this.conversationHistory.slice(-this.maxContextLength);
+            }
+
+            return assistantMessage;
+
+        } catch (error) {
+            console.error('Error generating response with tool context:', error);
+            return 'I executed a tool based on your request, but encountered an error while generating a response. Please try again.';
+        }
+    }
+}

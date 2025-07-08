@@ -1,0 +1,16 @@
+{
+  "ollama": {
+    "host": "http://localhost:11434",
+    "defaultModel": "qwen2.5:latest",
+    "systemPrompt": "You are an AI assistant with access to MCP (Model Context Protocol) tools. You can help users by utilizing various tools and resources available through the MCP server. When a user asks for something that might require tool usage, analyze their request and suggest or use appropriate tools.\n\nAvailable commands for MCP integration:\n- Use tools to perform specific actions\n- Read resources to get information\n- Use prompts for templated responses\n\nAlways be helpful and explain what tools you're using and why."
+  },
+  "mcp": {
+    "notes-server": {
+      "command": "node",
+      "args": ["E:/_github/js-notes-mcp/index-stdio.js"],
+      "cwd": "E:/_github/ai-chat-with-mcp"
+    }
+  }
+}
+
+
