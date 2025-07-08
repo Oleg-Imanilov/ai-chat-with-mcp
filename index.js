@@ -1,21 +1,23 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import AIChatLoop from "./src/AIChatLoop.js";
-import MultiServerClient from "./src/MultiServerClient.js"; 
+import ChatInterface from "./src/ui/ChatInterface.js";
+import MultiServerClient from "./src/mcp/MultiServerClient.js";
+import ConfigManager from "./src/config/ConfigManager.js";
 
 // Get current directory for ES modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Load configuration
-const configPath = path.join(__dirname, 'config.json');
-const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+// Initialize configuration manager
+const configManager = new ConfigManager();
 
 
 async function main() {
     try {
-        const serverNames = Object.keys(config.mcp) || [];
+        // Validate and load configuration
+        configManager.validate();
+        const serverNames = configManager.getMCPServerNames();
 
         if (serverNames.length === 0) {
             console.error("No MCP servers configured in config.json");
@@ -29,7 +31,7 @@ async function main() {
 
         // Connect to all servers
         for (const serverName of serverNames) {
-            const serverConfig = config.mcp[serverName];
+            const serverConfig = configManager.getMCPServerConfig(serverName);
             try {
                 await multiClient.addServer(serverName, serverConfig);
             } catch (error) {
@@ -50,7 +52,7 @@ Successfully connected to ${multiClient.servers.size} server(s)
 Make sure Ollama is running on your system!
 If you don't have Ollama, download it from: https://ollama.ai`);
         
-        const chatLoop = new AIChatLoop(multiClient);
+        const chatLoop = new ChatInterface(multiClient, configManager);
         await chatLoop.run();    
 
     } catch (error) {

@@ -1,4 +1,4 @@
-import { highlight, success, error } from "./utils.js";
+import { highlight, success, error } from "../ui/utils.js";
 
 export function logServerCapabilities(client) {
     console.log("\n=== Server Capabilities ===");

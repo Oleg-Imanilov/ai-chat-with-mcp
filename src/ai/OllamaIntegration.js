@@ -1,28 +1,24 @@
 import { Ollama } from 'ollama';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { dim } from './utils.js';
+import { 
+    DEFAULTS, 
+    MESSAGE_ROLES 
+} from '../config/constants.js';
+import ConfigManager from '../config/ConfigManager.js';
 
-// Get current directory for ES modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
-// Load configuration
-const configPath = path.join(__dirname, '..', 'config.json');
-const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+// Initialize configuration manager
+const cfg = new ConfigManager();
 
 export default class OllamaIntegration {
     constructor(options = {}) {
         this.ollama = new Ollama({
-            host: options.host || config.ollama.host
+            host: options.host || cfg.getOllamaHost()
         });
-        this.model = options.model || config.ollama.defaultModel;
-        this.systemPrompt = options.systemPrompt || config.ollama.systemPrompt;
+        this.model = options.model || cfg.getDefaultModel();
+        this.systemPrompt = options.systemPrompt || cfg.getSystemPrompt();
         this.conversationHistory = [];
-        this.contextEntities = new Map(); // Track mentioned entities (notes, files, etc.)
-        this.maxContextLength = options.maxContextLength || 100; // Increased from 20 to 100 messages
-        this.debugLogging = options.debugLogging || false; // Control internal LLM call logging
+        this.maxContextLength = options.maxContextLength || DEFAULTS.MAX_CONTEXT_LENGTH;
+        this.debugLogging = options.debugLogging || DEFAULTS.DEBUG_LOGGING;
     }
 
     async initialize() {
@@ -50,24 +46,21 @@ export default class OllamaIntegration {
         try {
             // Add user message to conversation history
             this.conversationHistory.push({
-                role: 'user',
+                role: MESSAGE_ROLES.USER,
                 content: userMessage,
                 timestamp: new Date().toISOString()
             });
 
-            // Extract and track entities from user message
-            this.trackEntitiesFromMessage(userMessage);
-
             // Analyze user message and automatically execute tools if needed
             const autoExecutionResult = await this.analyzeAndExecuteTools(userMessage, mcpClient);
             if (autoExecutionResult) {
-                // If tools were automatically executed, add the result to conversation
+                // If tools were automatically executed, add the formatted result to conversation
                 this.conversationHistory.push({
-                    role: 'assistant',
-                    content: autoExecutionResult,
+                    role: MESSAGE_ROLES.ASSISTANT,
+                    content: autoExecutionResult.formatted,
                     timestamp: new Date().toISOString()
                 });
-                return autoExecutionResult;
+                return autoExecutionResult.formatted;
             }
 
             // Prepare context about available MCP tools/resources
@@ -119,7 +112,7 @@ Always explain what you're doing and provide the results in a user-friendly form
             // Create messages for the model
             const messages = [
                 {
-                    role: 'system',
+                    role: MESSAGE_ROLES.SYSTEM,
                     content: enhancedSystemPrompt
                 },
                 ...this.conversationHistory
@@ -139,7 +132,7 @@ Always explain what you're doing and provide the results in a user-friendly form
 
             // Add assistant response to conversation history
             this.conversationHistory.push({
-                role: 'assistant',
+                role: MESSAGE_ROLES.ASSISTANT,
                 content: assistantMessage,
                 timestamp: new Date().toISOString()
             });
@@ -264,7 +257,7 @@ Use the exact tool name (not qualified name) for toolName field.`;
             this.debugLog("Parsed tool analysis result:", analysis);
             
             // Only execute if confidence is high enough
-            if (analysis.shouldExecute && analysis.confidence >= 0.7) {
+            if (analysis.shouldExecute && analysis.confidence >= DEFAULTS.CONFIDENCE_THRESHOLD) {
                 this.debugLog("Tool execution approved with confidence:", analysis.confidence);
                 return analysis;
             }
@@ -280,7 +273,6 @@ Use the exact tool name (not qualified name) for toolName field.`;
 
     clearHistory() {
         this.conversationHistory = [];
-        this.contextEntities.clear();
     }
 
     setModel(model) {
@@ -300,97 +292,24 @@ Use the exact tool name (not qualified name) for toolName field.`;
             const grayColor = '\x1b[90m'; // Gray color
             const resetColor = '\x1b[0m'; // Reset color
             if (data) {
-                console.log(`${grayColor}[DEBUG] ${message}${resetColor}`, dim(data));
+                console.log(`${grayColor}[DEBUG] ${message}${resetColor}`, data);
             } else {
                 console.log(`${grayColor}[DEBUG] ${message}${resetColor}`);
             }
         }
     }
 
-    trackEntitiesFromMessage(message) {
-        const lowerMessage = message.toLowerCase();
-        
-        // Generic entity tracking - look for quoted strings and common patterns
-        const quotedMatches = message.match(/["']([^"']+)["']/g);
-        if (quotedMatches) {
-            quotedMatches.forEach(match => {
-                const entityName = match.slice(1, -1);
-                if (entityName.length > 1) {
-                    // Determine entity type based on context
-                    let entityType = 'unknown';
-                    if (lowerMessage.includes('note')) entityType = 'note';
-                    else if (lowerMessage.includes('folder') || lowerMessage.includes('path') || lowerMessage.includes('directory')) entityType = 'folder';
-                    else if (lowerMessage.includes('file')) entityType = 'file';
-                    else if (lowerMessage.includes('resource')) entityType = 'resource';
-                    
-                    this.contextEntities.set(`${entityType}:${entityName.toLowerCase()}`, {
-                        type: entityType,
-                        name: entityName,
-                        lastMentioned: new Date().toISOString(),
-                        frequency: (this.contextEntities.get(`${entityType}:${entityName.toLowerCase()}`)?.frequency || 0) + 1
-                    });
-                }
-            });
-        }
-        
-        // Track common patterns without quotes
-        const patterns = [
-            { regex: /(?:note|item|entry)\s+(?:called|named)\s+(\w+)/gi, type: 'note' },
-            { regex: /(?:folder|directory|path)\s+(?:called|named)\s+(\w+)/gi, type: 'folder' },
-            { regex: /(?:file)\s+(?:called|named)\s+(\w+)/gi, type: 'file' },
-            { regex: /(?:resource)\s+(?:called|named)\s+(\w+)/gi, type: 'resource' }
-        ];
-        
-        for (const pattern of patterns) {
-            let match;
-            while ((match = pattern.regex.exec(message)) !== null) {
-                const entityName = match[1];
-                if (entityName && entityName.length > 1 && !['the', 'my', 'a', 'an', 'this', 'that'].includes(entityName.toLowerCase())) {
-                    this.contextEntities.set(`${pattern.type}:${entityName.toLowerCase()}`, {
-                        type: pattern.type,
-                        name: entityName,
-                        lastMentioned: new Date().toISOString(),
-                        frequency: (this.contextEntities.get(`${pattern.type}:${entityName.toLowerCase()}`)?.frequency || 0) + 1
-                    });
-                }
-            }
-        }
-    }
-
-    getRecentEntities(type = null, limit = 10) {
-        const entities = Array.from(this.contextEntities.values());
-        
-        let filtered = type ? entities.filter(e => e.type === type) : entities;
-        
-        // Sort by last mentioned time and frequency
-        filtered.sort((a, b) => {
-            const timeA = new Date(a.lastMentioned).getTime();
-            const timeB = new Date(b.lastMentioned).getTime();
-            if (timeA !== timeB) return timeB - timeA; // Most recent first
-            return b.frequency - a.frequency; // Most frequent first if same time
-        });
-        
-        return filtered.slice(0, limit);
+    getRecentEntities(type = null, limit = DEFAULTS.RECENT_ENTITIES_LIMIT) {
+        // Legacy method - now returns empty array as entities are handled by LLM context
+        return [];
     }
 
     buildContextualPrompt(userMessage, toolName, toolSchema) {
-        // Get conversation context (last 10 messages for parameter extraction)
-        const recentHistory = this.conversationHistory.slice(-10);
+        // Get conversation context (last N messages for parameter extraction)
+        const recentHistory = this.conversationHistory.slice(-DEFAULTS.RECENT_ENTITIES_LIMIT);
         const conversationContext = recentHistory.map(msg => 
             `${msg.role}: ${msg.content}`
         ).join('\n');
-        
-        // Get relevant entities
-        const recentNotes = this.getRecentEntities('note', 5);
-        const recentFolders = this.getRecentEntities('folder', 3);
-        
-        let contextInfo = '';
-        if (recentNotes.length > 0) {
-            contextInfo += `\nRecently mentioned notes: ${recentNotes.map(n => n.name).join(', ')}`;
-        }
-        if (recentFolders.length > 0) {
-            contextInfo += `\nRecently mentioned folders: ${recentFolders.map(f => f.path).join(', ')}`;
-        }
 
         return `Extract parameters for the tool "${toolName}" from this user message, considering the full conversation context.
 
@@ -398,7 +317,6 @@ Current user message: "${userMessage}"
 
 Recent conversation context:
 ${conversationContext}
-${contextInfo}
 
 Tool schema: ${JSON.stringify(toolSchema, null, 2)}
 
@@ -406,7 +324,7 @@ Instructions:
 1. Look at the ENTIRE conversation context to understand what the user is referring to
 2. If the user says "update mentioned note" or "delete that note", find the note name from previous messages
 3. If the user refers to "it", "that", "the one", etc., use context to determine what they mean
-4. When extracting note names, prefer recently mentioned ones if the current message is ambiguous
+4. When extracting parameters, prefer recently mentioned items if the current message is ambiguous
 5. Use conversation context to fill in missing parameters
 
 Please respond with ONLY a valid JSON object containing the extracted parameters. If a parameter cannot be determined from the message or context, omit it from the response.
@@ -564,7 +482,7 @@ Use the exact tool name (not qualified name) for toolName field.`;
             this.debugLog("Parsed user intent analysis result:", analysis);
             
             // Only execute if confidence is high enough
-            if (analysis.shouldExecute && analysis.confidence >= 0.7) {
+            if (analysis.shouldExecute && analysis.confidence >= DEFAULTS.CONFIDENCE_THRESHOLD) {
                 this.debugLog("User intent analysis approved with confidence:", analysis.confidence);
                 return analysis;
             }
@@ -586,7 +504,7 @@ Tool schema: ${JSON.stringify(toolSchema, null, 2)}
 
 Argument string: "${argString}"
 Full context: "${context}"
-Recent conversation: ${this.conversationHistory.slice(-3).map(msg => `${msg.role}: ${msg.content}`).join('\n')}
+Recent conversation: ${this.conversationHistory.slice(-DEFAULTS.PARAMETER_EXTRACTION_HISTORY).map(msg => `${msg.role}: ${msg.content}`).join('\n')}
 
 Instructions:
 1. Parse the argument string and context to extract tool parameters
@@ -704,90 +622,12 @@ Response:`;
             }
         }
         
-        // If the message is ambiguous, use recently mentioned entities
-        const ambiguousPatterns = [
-            /(?:update|edit|modify|change).*(?:mentioned|that|the|it)/i,
-            /(?:delete|remove).*(?:mentioned|that|the|it)/i,
-            /(?:get|show|read).*(?:mentioned|that|the|it)/i
-        ];
-        
-        const isAmbiguous = ambiguousPatterns.some(pattern => pattern.test(userMessage));
-        
-        if (isAmbiguous) {
-            // Use the most recently mentioned entity of any type
-            const recentEntities = this.getRecentEntities(null, 1);
-            if (recentEntities.length > 0) {
-                const entity = recentEntities[0];
-                if (entity.type === 'note') {
-                    params.name = entity.name;
-                } else if (entity.type === 'folder') {
-                    params.path = entity.path;
-                    params.folderPath = entity.path;
-                }
-            }
-        }
-        
         return params;
     }
 
     formatToolResponse(toolName, toolResult, args) {
-        // Track successful operations for future reference (generic entity tracking)
-        this.trackSuccessfulOperation(toolName, args);
-
         // Use the dynamic formatting method
         return this.simpleFormatToolResponse(toolName, toolResult, args);
-    }
-
-    trackSuccessfulOperation(toolName, args) {
-        // Generic tracking based on common parameter patterns
-        if (args.name) {
-            // Determine entity type from tool name
-            let entityType = 'item';
-            if (toolName.includes('note')) entityType = 'note';
-            else if (toolName.includes('file')) entityType = 'file';
-            else if (toolName.includes('folder') || toolName.includes('directory')) entityType = 'folder';
-            else if (toolName.includes('resource')) entityType = 'resource';
-            
-            let operation = 'processed';
-            if (toolName.includes('create') || toolName.includes('add')) operation = 'created';
-            else if (toolName.includes('update') || toolName.includes('edit') || toolName.includes('modify')) operation = 'updated';
-            else if (toolName.includes('delete') || toolName.includes('remove')) operation = 'deleted';
-            else if (toolName.includes('get') || toolName.includes('list') || toolName.includes('show')) operation = 'accessed';
-
-            this.contextEntities.set(`${entityType}:${args.name.toLowerCase()}`, {
-                type: entityType,
-                name: args.name,
-                lastMentioned: new Date().toISOString(),
-                frequency: (this.contextEntities.get(`${entityType}:${args.name.toLowerCase()}`)?.frequency || 0) + 1,
-                operation: operation
-            });
-        }
-
-        // Track entities from tool results if they contain arrays of items
-        if (toolResult?.content?.[0]?.text) {
-            try {
-                const data = JSON.parse(toolResult.content[0].text);
-                if (Array.isArray(data)) {
-                    data.forEach(item => {
-                        if (item.name) {
-                            let entityType = 'item';
-                            if (toolName.includes('note')) entityType = 'note';
-                            else if (toolName.includes('file')) entityType = 'file';
-                            
-                            this.contextEntities.set(`${entityType}:${item.name.toLowerCase()}`, {
-                                type: entityType,
-                                name: item.name,
-                                lastMentioned: new Date().toISOString(),
-                                frequency: (this.contextEntities.get(`${entityType}:${item.name.toLowerCase()}`)?.frequency || 0) + 1,
-                                operation: 'listed'
-                            });
-                        }
-                    });
-                }
-            } catch (e) {
-                // Ignore JSON parsing errors for entity tracking
-            }
-        }
     }
 
     formatResourceResponse(resourceContent) {
@@ -813,13 +653,10 @@ Response:`;
         try {
             // Add user message to conversation history
             this.conversationHistory.push({
-                role: 'user',
+                role: MESSAGE_ROLES.USER,
                 content: userMessage,
                 timestamp: new Date().toISOString()
             });
-
-            // Extract and track entities from user message
-            this.trackEntitiesFromMessage(userMessage);
 
             // Add tool execution result as context
             const toolContext = `\n\n=== Tool Execution Result ===\nTool: ${toolExecutionResult.toolName}\nArguments: ${JSON.stringify(toolExecutionResult.arguments)}\nResult: ${JSON.stringify(toolExecutionResult.rawResult, null, 2)}\n=== End Tool Result ===\n`;
@@ -870,7 +707,7 @@ Please provide a comprehensive, user-friendly response based on the tool executi
             // Create messages for the model
             const messages = [
                 {
-                    role: 'system',
+                    role: MESSAGE_ROLES.SYSTEM,
                     content: enhancedSystemPrompt
                 },
                 ...this.conversationHistory
@@ -890,7 +727,7 @@ Please provide a comprehensive, user-friendly response based on the tool executi
 
             // Add assistant response to conversation history
             this.conversationHistory.push({
-                role: 'assistant',
+                role: MESSAGE_ROLES.ASSISTANT,
                 content: assistantMessage,
                 timestamp: new Date().toISOString()
             });
